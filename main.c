@@ -16,7 +16,7 @@
 #define MAX_MODES (256)
 #define MAX_TEMP_RANGES (256)
 
-// for unknown reasons addresses in the .wrf file 
+// for unknown reasons addresses in the .wrf file
 // need to be offset by 63 bytes
 #define MYSTERIOUS_OFFSET (63)
 
@@ -155,6 +155,7 @@ Pair waveform_types[] = {
   {0x4B, "AC"},
   {0x4C, "BD"},
   {0x50, "AE"},
+  {0x51, "AF"},
   {0x00, NULL}
 };
 
@@ -268,6 +269,13 @@ struct unpacked_state {
   uint8_t s3;
 }__attribute__((packed));
 
+struct unpacked_state_5bpp {
+  uint8_t s0:4;
+  uint8_t s1:4;
+  uint8_t s2:4;
+  uint8_t s3:4;
+}__attribute__((packed));
+
 
 uint8_t get_bits_per_pixel(struct waveform_data_header* header) {
   return ((header->luts & 0xc) == 4) ? 5 : 4;
@@ -298,7 +306,7 @@ unsigned int update_crc(unsigned int* crc_table, unsigned crc,
   char b;
   unsigned c = crc ^ 0xffffffff;
   int i;
-  
+
   for(i=0; i < len; i++) {
     if(!buf) {
       b = 0;
@@ -307,19 +315,19 @@ unsigned int update_crc(unsigned int* crc_table, unsigned crc,
     }
     c = crc_table[(c ^ b) & 0xff] ^ (c >> 8);
   }
-  
+
   return c ^ 0xffffffff;
 }
 
 unsigned crc32(unsigned char *buf, int len) {
   static unsigned int crc_table[256];
-  
+
   compute_crc_table(crc_table);
-  
+
   return update_crc(crc_table, 0, buf, len);
 }
 
-// TODO 
+// TODO
 
 int compare_checksum(char* data, struct waveform_data_header* header) {
   unsigned int crc;
@@ -333,7 +341,7 @@ int compare_checksum(char* data, struct waveform_data_header* header) {
   }
   return 0;
 }
-  
+
 
 int bubble_sort(uint32_t* wav_addrs) {
   uint32_t i;
@@ -394,14 +402,15 @@ void print_header(struct waveform_data_header* header, int is_wbf) {
   printf("  Waveform sub-version: %d\n", header->waveform_subversion);
 
   printf("  Waveform type: 0x%x | %s\n", header->waveform_type, get_desc(waveform_types, header->waveform_type, NULL));
+  printf("  Advanced Waveform Information: 0x%x\n", header->advanced_wfm_flags);
 
-  // if waveform_type is WJ or earlier 
+  // if waveform_type is WJ or earlier
   // then waveform_tuning_bias_or_rev is the tuning bias.
   // if it is WR type or later then it is the revision.
   // if it is in between then we don't know.
   if(header->waveform_type <= 0x15) { // WJ type or earlier
     printf("  Waveform tuning bias: 0x%x | %s\n", header->waveform_tuning_bias_or_rev, get_desc(waveform_tuning_biases, header->waveform_tuning_bias_or_rev, NULL));
-    printf("  Waveform revision: Unknown\n");    
+    printf("  Waveform revision: Unknown\n");
   } else if(header->waveform_type >= 0x2B) { // WR type or later
     printf("  Waveform tuning bias: Unknown\n");
     printf("  Waveform revision: %d\n", header->waveform_tuning_bias_or_rev);
@@ -410,7 +419,7 @@ void print_header(struct waveform_data_header* header, int is_wbf) {
     printf("  Waveform revision: Unknown\n");
   }
 
-  // if fpl_platform is < 3 then 
+  // if fpl_platform is < 3 then
   // mode_version_or_adhesive_run_num is the adhesive run number
   if(header->fpl_platform < 3) {
     printf("  Adhesive run number: %d\n", header->mode_version_or_adhesive_run_num);
@@ -442,16 +451,20 @@ uint32_t get_waveform_length(uint32_t* wav_addrs, uint32_t wav_addr) {
   return 0;
 }
 
-uint16_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE* outfile) {
+uint32_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE* outfile, uint8_t bpp, int outfile_type) {
   uint32_t i, j;
   struct packed_state* s;
+  struct unpacked_state_5bpp u5;
   struct unpacked_state u;
-  uint16_t count;
+  uint32_t count;
   int fc_active;
   int zero_pad;
   size_t written;
-  uint16_t state_count = 0;
+  uint32_t state_count = 0;
   char* waveform = data + wav_addr;
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t phase = 0;
 
   // TODO
   // We are cutting off the last two bytes
@@ -466,6 +479,11 @@ uint16_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE
   fc_active = 0;
   zero_pad = 0;
   i = 0;
+
+
+  if (outfile && outfile_type == 2) {
+    fprintf(outfile, "[[[");
+  }
   while(i < len - 1) {
     // 0xfc is a start and end tag for a section
     // of one-byte bit-patterns with an assumed count of 1
@@ -485,7 +503,10 @@ uint16_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE
       if(i >= len - 1) {
         count = 1;
       } else {
-        count = (uint8_t) waveform[i + 1] + 1;
+        count = ((uint8_t) waveform[i + 1]) + 1;
+      }
+      if (*((uint8_t*)s) == 0xff) {
+        break;
       }
       zero_pad = 0;
       i += 2;
@@ -493,7 +514,37 @@ uint16_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE
 
     state_count += count * 4;
 
-    if(outfile) {
+
+    if (outfile && bpp == 5) {
+      // 5bpp wrf output unsupported
+      if (outfile_type != 2) {
+        return -2;
+      }
+
+      for(j=0; j < count; j++) {
+        if (x == 0 && y == 0 && phase > 0) {
+          fprintf(outfile, ",\n\t[[");
+        }
+        fprintf(outfile, "%X, %X, %X, %X ", s->s0, s->s1, s->s2, s->s3);
+        x += 4;
+        if (x >= 32) {
+          x = 0;
+          y++;
+          fprintf(outfile, "]");
+          if (y <= 31) {
+            fprintf(outfile, ", [");
+          }
+        } else {
+          fprintf(outfile, ",");
+        }
+        if (y >= 32) {
+          fprintf(outfile, "]");
+          y = 0;
+          phase++;
+        }
+
+      }
+    } else if(outfile && bpp == 4 && outfile_type == 1) {
 
       u.s0 = s->s0;
       u.s1 = s->s1;
@@ -510,15 +561,18 @@ uint16_t parse_waveform(char* data, uint32_t* wav_addrs, uint32_t wav_addr, FILE
       }
     }
   }
+  if (outfile && outfile_type == 2) {
+    fprintf(outfile, "]\n");
+  }
 
   return state_count;
 }
 
-int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_start, uint8_t tr_count, uint32_t* wav_addrs, int first_pass, FILE* outfile, int do_print) {
+int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_start, uint8_t tr_count, uint32_t* wav_addrs, int first_pass, FILE* outfile, int do_print, int outfile_type) {
   struct pointer* tr;
   uint8_t checksum;
   uint8_t i;
-  uint16_t state_count;
+  uint32_t state_count;
   size_t written;
   long ftable;
   long fprev;
@@ -537,7 +591,7 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
   }
 
 
-  if(outfile) {
+  if(outfile && outfile_type == 1) {
     ftable = ftell(outfile);
     if(ftable < 0) {
       fprintf(stderr, "Error getting position in file: %s\n", strerror(errno));
@@ -545,13 +599,21 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
     }
     if(fseek(outfile, (header->trc + 1) * 8, SEEK_CUR) < 0) {
       fprintf(stderr, "Error seeking in output file: %s\n", strerror(errno));
-      return -1;      
+      return -1;
     }
+  }
+
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "[");
   }
 
   for(i=0; i < tr_count; i++) {
     if(do_print) {
       printf("      Checking range %2u: ", i);
+    }
+
+    if(outfile && outfile_type == 2) {
+      fprintf(outfile, "{\"index\": %d, \"phases\": ", i);
     }
     tr = (struct pointer*) tr_start;
     checksum = tr_start[0] + tr_start[1] + tr_start[2];
@@ -568,7 +630,7 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
       }
     } else {
 
-      if(outfile) {
+      if(outfile && outfile_type == 1) {
 
         fprev = ftell(outfile); // save position to use for writing phase count
         if(fprev < 0) {
@@ -585,16 +647,24 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
           return -1;
         }
       }
-      state_count = parse_waveform(data, wav_addrs, tr->addr, outfile);
+
+      state_count = parse_waveform(data, wav_addrs, tr->addr, outfile, get_bits_per_pixel(header), outfile_type);
       if(state_count < 0) {
         return -1;
       }
 
-      if(do_print) {
-        printf("%4u phases\n", state_count / 256);
+      uint32_t divisor = 16 * 16;
+      if (get_bits_per_pixel(header) == 5) {
+          divisor = 32 * 32;
       }
 
-      if(outfile) {
+      if(do_print) {
+        printf("%4f phases (%d count)\n", state_count / (1.0 * divisor), state_count);
+      }
+
+       //exit(0);
+
+      if(outfile && outfile_type == 1) {
         fcur = ftell(outfile); // save current position in file
         if(fcur < 0) {
           fprintf(stderr, "Error getting position in file: %s\n", strerror(errno));
@@ -622,12 +692,20 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
     }
 
     tr_start += 4;
+    if(outfile && outfile_type == 2) {
+      fprintf(outfile, "}");
+      if (i < tr_count - 1) fprintf(outfile, ",");
+    }
   }
   if(do_print) {
     printf("\n");
   }
 
-  if(outfile) {
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "]");
+  }
+
+  if(outfile && outfile_type == 1) {
     if(write_table(ftable, tr_addrs, outfile, MAX_TEMP_RANGES) < 0) {
       fprintf(stderr, "Error writing temperature range table\n");
       return -1;
@@ -639,7 +717,7 @@ int parse_temp_ranges(struct waveform_data_header* header, char* data, char* tr_
 }
 
 
-int parse_modes(struct waveform_data_header* header, char* data, char* mode_start, uint8_t mode_count, uint8_t temp_range_count, uint32_t* wav_addrs, int first_pass, FILE* outfile, int do_print) {
+int parse_modes(struct waveform_data_header* header, char* data, char* mode_start, uint8_t mode_count, uint8_t temp_range_count, uint32_t* wav_addrs, int first_pass, FILE* outfile, int do_print, int outfile_type) {
   struct pointer* mode;
   uint8_t checksum;
   uint8_t i;
@@ -657,9 +735,16 @@ int parse_modes(struct waveform_data_header* header, char* data, char* mode_star
     printf("Modes: \n");
   }
 
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "[");
+  }
+
   for(i=0; i < mode_count; i++) {
     if(do_print) {
       printf("  Checking mode %2u: ", i);
+    }
+    if(outfile && outfile_type == 2) {
+      fprintf(outfile, "{\"mode\": %d, \"ranges\": ", i);
     }
     mode = (struct pointer*) mode_start;
     checksum = mode_start[0] + mode_start[1] + mode_start[2];
@@ -670,7 +755,7 @@ int parse_modes(struct waveform_data_header* header, char* data, char* mode_star
       return -1;
     }
 
-    if(outfile) {
+    if(outfile && outfile_type == 1) {
 
       pos = ftell(outfile) - MYSTERIOUS_OFFSET;
       if(pos < 0) {
@@ -686,15 +771,21 @@ int parse_modes(struct waveform_data_header* header, char* data, char* mode_star
     if(do_print) {
       printf("Passed\n");
     }
-    if(parse_temp_ranges(header, data, data + mode->addr, temp_range_count, wav_addrs, first_pass, outfile, do_print) < 0) {
+    if(parse_temp_ranges(header, data, data + mode->addr, temp_range_count, wav_addrs, first_pass, outfile, do_print, outfile_type) < 0) {
       return -1;
     }
-    
+    if(outfile && outfile_type == 2) {
+      fprintf(outfile, "}");
+      if (i < mode_count - 1) fprintf(outfile, ",");
+    }
+
     mode_start += 4;
   }
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "]");
+  }
 
-
-  if(outfile) {
+  if(outfile && outfile_type == 1) {
     // the + 2 is because there is one more temperature range than the
     // count in header->trc and then because these are ranges there is one
     // more temperature than the number of ranges
@@ -728,7 +819,7 @@ int check_xwia(char* xwia, int do_print) {
   }
 
   if(do_print) {
-    
+
     printf("Extra Waveform Info (xwia): ");
 
     if(!xwia_len) {
@@ -740,7 +831,7 @@ int check_xwia(char* xwia, int do_print) {
         printf("%c", xwia[i]);
       }
     }
-    
+
     printf("\n\n");
   }
 
@@ -750,7 +841,7 @@ int check_xwia(char* xwia, int do_print) {
   return 0;
 }
 
-int parse_temp_range_table(char* table, uint8_t range_count, FILE* outfile, int do_print) {
+int parse_temp_range_table(char* table, uint8_t range_count, FILE* outfile, int do_print, int outfile_type) {
   uint8_t i;
   uint8_t checksum;
   struct temp_range range;
@@ -764,6 +855,9 @@ int parse_temp_range_table(char* table, uint8_t range_count, FILE* outfile, int 
     printf("Supported temperature ranges:\n");
   }
 
+  if (outfile && outfile_type == 2) {
+    fprintf(outfile, "{\"range_bounds\": [");
+  }
   checksum = 0;
   for(i=0; i < range_count; i++) {
     range.from = (uint8_t) table[i];
@@ -772,14 +866,22 @@ int parse_temp_range_table(char* table, uint8_t range_count, FILE* outfile, int 
       printf("  %u - %u °C\n", range.from, range.to);
     }
     checksum += range.from;
+    if (outfile && outfile_type == 2) {
+      fprintf(outfile, "{\"from\": %d, \"to\": %d}", range.from, range.to);
+      if (i < range_count - 1) fprintf(outfile, ",\n");
+    }
   }
   checksum += range.to;
- 
+
+  if (outfile && outfile_type == 2) {
+    fprintf(outfile, "]}");
+  }
+
   if(checksum != (uint8_t) table[range_count+1]) {
     return -1;
   }
 
-  if(outfile) {
+  if(outfile && outfile_type == 1) {
     written = fwrite(table, 1, range_count+1, outfile);
     if(written != range_count+1) {
       fprintf(stderr, "Error writing temperature range table to output file: %s\n", strerror(errno));
@@ -830,7 +932,7 @@ int write_table(uint32_t table_addr, uint32_t* addrs, FILE* outfile, uint32_t ma
   if(fseek(outfile, prev, SEEK_SET) < 0) {
     fprintf(stderr, "Error seeking in output file: %s\n", strerror(errno));
     return -1;
-  }  
+  }
 
   return 0;
 }
@@ -888,6 +990,7 @@ int main(int argc, char **argv) {
   uint32_t unique_waveform_count;
   uint32_t wav_addrs[MAX_WAVEFORMS]; // waveform addresses in input file
   uint32_t is_wbf;
+  uint32_t outfile_type = 2;
   size_t to_alloc;
 
   memset(wav_addrs, 0, sizeof(wav_addrs));
@@ -937,7 +1040,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "File has neither .wbf or .wrf extension\n");
       fprintf(stderr, "Consider using `-f` to bypass file format detection\n");
       goto fail;
-    }  
+    }
   }
 
   if(!is_wbf && outfile_path) {
@@ -1002,7 +1105,8 @@ int main(int argc, char **argv) {
     }
   }
 
-  if(outfile) {
+
+  if(outfile && outfile_type == 1) {
     if(get_bits_per_pixel(header) != 4) {
       fprintf(stderr, "This waveform uses 5 bits per pixel which is not yet support\n");
       goto fail;
@@ -1010,16 +1114,18 @@ int main(int argc, char **argv) {
   }
 
   if(is_wbf) {
+      /*
     if(compare_checksum(data, header) < 0)  {
       fprintf(stderr, "Checksum error\n");
       goto fail;
     }
+    */
   }
 
   if(do_print) {
     print_header(header, is_wbf);
-    
-    if(header->fpl_platform < 3) {
+
+    if(header->fpl_platform < 3 && 0) {
       printf("Modes: Unknown (no mode version specified)\n");
     } else {
       print_modes(header->mc + 1);
@@ -1030,25 +1136,34 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if(outfile) {
+  if(outfile && outfile_type == 1) {
     if(write_header(outfile, header) < 0) {
       fprintf(stderr, "Writing header to output failed\n");
       goto fail;
     }
   }
 
+
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "{\"temperature_ranges\": ");
+  }
+
   // start of temperature range table
   temp_range_table = data + sizeof(struct waveform_data_header);
 
-  if(parse_temp_range_table(temp_range_table, header->trc + 1, outfile, do_print)) {
+  if(parse_temp_range_table(temp_range_table, header->trc + 1, outfile, do_print, outfile_type)) {
     fprintf(stderr, "Temperature range checksum error\n");
-    goto fail;   
+    goto fail;
   }
 
-  if(outfile) {
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, ", \"modes\": ");
+  }
+
+  if(outfile && outfile_type == 1) {
     if(fseek(outfile, 8 * (header->mc + 1), SEEK_CUR) < 0) {
       fprintf(stderr, "Error seeking in output file: %s\n", strerror(errno));
-      return -1;      
+      return -1;
     }
   }
 
@@ -1067,16 +1182,16 @@ int main(int argc, char **argv) {
   // last byte after xwia is a checksum
   modes = data + header->xwia + 1 + xwia_len + 1;
 
-  if(parse_modes(header, data, modes, header->mc + 1, header->trc + 1, wav_addrs, 1, NULL, 0) < 0) {
+  if(parse_modes(header, data, modes, header->mc + 1, header->trc + 1, wav_addrs, 1, NULL, 0, 0) < 0) {
     fprintf(stderr, "Parse error during first pass\n");
-    goto fail; 
+    goto fail;
   }
 
   unique_waveform_count = bubble_sort(wav_addrs);
   if(do_print) {
     printf("Number of unique waveforms: %u\n\n", unique_waveform_count);
   }
-  
+
   // add file endpoint to waveform address table
   // since we use this to determine end address of each waveform
   if(add_addr(wav_addrs, st.st_size, MAX_WAVEFORMS) < 0) {
@@ -1085,9 +1200,13 @@ int main(int argc, char **argv) {
   }
 
   // parse modes again since we now have all the sorted waveform addresses
-  if(parse_modes(header, data, modes, header->mc + 1, header->trc + 1, wav_addrs, 0, outfile, do_print) < 0) {
+  if(parse_modes(header, data, modes, header->mc + 1, header->trc + 1, wav_addrs, 0, outfile, do_print, outfile_type) < 0) {
     fprintf(stderr, "Parse error during second pass\n");
-    goto fail; 
+    goto fail;
+  }
+
+  if(outfile && outfile_type == 2) {
+    fprintf(outfile, "}\n");
   }
 
   return 0;
